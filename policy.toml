@@ -1,0 +1,12 @@
+addr    = "0.0.0.0:8765"
+
+[upstreams]
+pypi = "https://pypi.org"
+
+[rules]
+min_age_days     = 7
+block_prerelease = false
+
+[overrides]
+# packages here skip all policy checks
+allow = []
