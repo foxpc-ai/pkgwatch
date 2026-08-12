@@ -8,6 +8,7 @@ import (
 	"net/url"
 	"slices"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/foxpc-ai/pkgwatch/config"
@@ -19,34 +20,42 @@ type responseRecorder struct {
 	status int
 }
 
+type cacheEntry struct {
+	meta      *registries.PackageMeta
+	expiresAt time.Time
+}
+
+type Handler struct {
+	cfg   *config.Policy
+	cache sync.Map // map[string]*cacheEntry
+}
+
 func (rec *responseRecorder) WriteHeader(code int) {
 	rec.status = code
 	rec.ResponseWriter.WriteHeader(code)
 }
 
-func NewHandler(cfg *config.Policy) http.Handler {
-	mux := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		switch {
-		case strings.HasPrefix(r.URL.Path, "/pypi/"):
-			handle(w, r, cfg, registries.PyPI{}, "pypi")
-		default:
-			http.Error(w, "pkgwatch: no route for path "+r.URL.Path, http.StatusNotFound)
-		}
-	})
+func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	start := time.Now()
+	recorder := &responseRecorder{ResponseWriter: w, status: http.StatusOK}
 
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		start := time.Now()
-		recorder := &responseRecorder{ResponseWriter: w, status: http.StatusOK}
+	switch {
+	case strings.HasPrefix(r.URL.Path, "/pypi/"):
+		h.handle(recorder, r, registries.PyPI{}, "pypi")
+	default:
+		http.Error(recorder, "pkgwatch: no route for path "+r.URL.Path, http.StatusNotFound)
+	}
 
-		mux.ServeHTTP(recorder, r)
-
-		log.Printf("[HTTP] %s | Status: %d | Duration: %v | Path: %s",
-			r.Method, recorder.status, time.Since(start), r.URL.Path)
-	})
+	log.Printf("[HTTP] %s | Status: %d | Duration: %v | Path: %s",
+		r.Method, recorder.status, time.Since(start), r.URL.Path)
 }
 
-func handle(w http.ResponseWriter, r *http.Request, cfg *config.Policy, reg registries.Registry, ecosystem string) {
-	upstream := cfg.Upstreams[ecosystem]
+func NewHandler(cfg *config.Policy) *Handler {
+	return &Handler{cfg: cfg}
+}
+
+func (h *Handler) handle(w http.ResponseWriter, r *http.Request, reg registries.Registry, ecosystem string) {
+	upstream := h.cfg.Upstreams[ecosystem]
 	if upstream == "" {
 		http.Error(w, "pkgwatch: no upstream configured for "+ecosystem, http.StatusInternalServerError)
 		return
@@ -54,14 +63,14 @@ func handle(w http.ResponseWriter, r *http.Request, cfg *config.Policy, reg regi
 
 	pkg := reg.ExtractPackage(r)
 
-	if pkg != nil && !isAllowed(cfg, pkg.Name) {
-		meta, err := reg.FetchMetadata(r.Context(), pkg, upstream)
+	if pkg != nil && !isAllowed(h.cfg, pkg.Name) {
+		meta, err := h.cachedFetch(r, reg, pkg, upstream, ecosystem)
 		if err != nil {
 			http.Error(w, "pkgwatch: metadata error: "+err.Error(), http.StatusBadGateway)
 			return
 		}
 
-		if violation := checkRules(cfg, meta); violation != "" {
+		if violation := checkRules(h.cfg, meta); violation != "" {
 			log.Printf("BLOCKED %s/%s: %s", ecosystem, pkg.Name, violation)
 			http.Error(w, "pkgwatch: blocked — "+violation, http.StatusForbidden)
 			return
@@ -71,6 +80,27 @@ func handle(w http.ResponseWriter, r *http.Request, cfg *config.Policy, reg regi
 	}
 
 	forward(w, r, upstream, "/"+ecosystem)
+}
+
+const cacheTTL = 5 * time.Minute
+
+func (h *Handler) cachedFetch(r *http.Request, reg registries.Registry, pkg *registries.PackageMeta, upstream, ecosystem string) (*registries.PackageMeta, error) {
+	key := ecosystem + "/" + pkg.Name
+
+	if v, ok := h.cache.Load(key); ok {
+		entry := v.(*cacheEntry)
+		if time.Now().Before(entry.expiresAt) {
+			return entry.meta, nil
+		}
+	}
+
+	meta, err := reg.FetchMetadata(r.Context(), pkg, upstream)
+	if err != nil {
+		return nil, err
+	}
+
+	h.cache.Store(key, &cacheEntry{meta: meta, expiresAt: time.Now().Add(cacheTTL)})
+	return meta, nil
 }
 
 func forward(w http.ResponseWriter, r *http.Request, upstream, stripPrefix string) {
