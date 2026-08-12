@@ -24,6 +24,8 @@ type Registry interface {
 
 type PyPI struct{}
 
+var httpClient = &http.Client{Timeout: 10 * time.Second}
+
 func (PyPI) ExtractPackage(r *http.Request) *PackageMeta {
 	path := strings.TrimPrefix(r.URL.Path, "/pypi")
 	parts := strings.Split(strings.Trim(path, "/"), "/")
@@ -51,7 +53,7 @@ func (PyPI) FetchMetadata(ctx context.Context, pkg *PackageMeta, upstream string
 		return nil, err
 	}
 
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := httpClient.Do(req)
 	if err != nil {
 		return nil, err
 	}
