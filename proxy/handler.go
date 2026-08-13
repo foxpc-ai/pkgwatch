@@ -129,6 +129,9 @@ func forward(w http.ResponseWriter, r *http.Request, upstream, stripPrefix strin
 }
 
 func checkRules(cfg *config.Policy, meta *registries.PackageMeta) string {
+	if cfg.Rules.BlockPrerelease && meta.IsPrerelease {
+		return fmt.Sprintf("%s@%s is a pre-release (policy blocks pre-releases)", meta.Name, meta.Version)
+	}
 	if cfg.Rules.MinAgeDays > 0 {
 		ageDays := int(time.Since(meta.PublishedAt).Hours() / 24)
 		if ageDays < cfg.Rules.MinAgeDays {
