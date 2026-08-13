@@ -92,6 +92,7 @@ func (h *Handler) cachedFetch(r *http.Request, reg registries.Registry, pkg *reg
 		if time.Now().Before(entry.expiresAt) {
 			return entry.meta, nil
 		}
+		h.evictExpired(key, entry, time.Now())
 	}
 
 	meta, err := reg.FetchMetadata(r.Context(), pkg, upstream)
@@ -99,8 +100,19 @@ func (h *Handler) cachedFetch(r *http.Request, reg registries.Registry, pkg *reg
 		return nil, err
 	}
 
-	h.cache.Store(key, &cacheEntry{meta: meta, expiresAt: time.Now().Add(cacheTTL)})
+	entry := &cacheEntry{meta: meta, expiresAt: time.Now().Add(cacheTTL)}
+	h.cache.Store(key, entry)
+	time.AfterFunc(time.Until(entry.expiresAt), func() {
+		h.evictExpired(key, entry, time.Now())
+	})
 	return meta, nil
+}
+
+func (h *Handler) evictExpired(key string, entry *cacheEntry, now time.Time) bool {
+	if now.Before(entry.expiresAt) {
+		return false
+	}
+	return h.cache.CompareAndDelete(key, entry)
 }
 
 func forward(w http.ResponseWriter, r *http.Request, upstream, stripPrefix string) {

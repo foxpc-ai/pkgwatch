@@ -45,3 +45,33 @@ func TestIsAllowed(t *testing.T) {
 		t.Error("expected unknown-pkg to not be allowed")
 	}
 }
+
+func TestEvictExpired(t *testing.T) {
+	handler := NewHandler(&config.Policy{})
+	key := "pypi/example"
+	expired := &cacheEntry{expiresAt: time.Now().Add(-time.Minute)}
+	handler.cache.Store(key, expired)
+
+	if !handler.evictExpired(key, expired, time.Now()) {
+		t.Fatal("expected expired cache entry to be evicted")
+	}
+	if _, ok := handler.cache.Load(key); ok {
+		t.Error("expired cache entry remains stored")
+	}
+}
+
+func TestEvictExpiredDoesNotDeleteReplacement(t *testing.T) {
+	handler := NewHandler(&config.Policy{})
+	key := "pypi/example"
+	stale := &cacheEntry{expiresAt: time.Now().Add(-time.Minute)}
+	replacement := &cacheEntry{expiresAt: time.Now().Add(time.Minute)}
+	handler.cache.Store(key, replacement)
+
+	if handler.evictExpired(key, stale, time.Now()) {
+		t.Fatal("stale expiry unexpectedly deleted a replacement")
+	}
+	got, ok := handler.cache.Load(key)
+	if !ok || got != replacement {
+		t.Error("replacement cache entry was not preserved")
+	}
+}
