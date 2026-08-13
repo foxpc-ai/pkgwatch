@@ -2,6 +2,7 @@ addr    = "0.0.0.0:8765"
 
 [upstreams]
 pypi = "https://pypi.org"
+npm  = "https://registry.npmjs.org"
 
 [rules]
 min_age_days     = 7
