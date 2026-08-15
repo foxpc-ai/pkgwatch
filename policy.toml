@@ -10,4 +10,4 @@ block_prerelease = false
 
 [overrides]
 # packages here skip all policy checks
-allow = []
+override_command = ""
