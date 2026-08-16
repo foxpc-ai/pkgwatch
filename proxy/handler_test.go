@@ -1,6 +1,10 @@
 package proxy
 
 import (
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -33,16 +37,25 @@ func TestCheckRules_MinAge(t *testing.T) {
 	}
 }
 
-func TestIsAllowed(t *testing.T) {
+func TestIsOverrideAllowAll(t *testing.T) {
 	cfg := &config.Policy{
-		Overrides: config.Overrides{Allow: []string{"trusted-pkg", "internal-lib"}},
+		Overrides: config.Overrides{OverrideCommand: "apple"},
+	}
+	req := httptest.NewRequest(http.MethodGet, "/pypi/simple/requests/?apple", nil)
+
+	if !isOverrideAllowAll(cfg, req) {
+		t.Error("expected override token in query to enable global override")
 	}
 
-	if !isAllowed(cfg, "trusted-pkg") {
-		t.Error("expected trusted-pkg to be allowed")
+	req = httptest.NewRequest(http.MethodGet, "/pypi/simple/requests/", nil)
+	if isOverrideAllowAll(cfg, req) {
+		t.Error("expected override to remain disabled when token is absent")
 	}
-	if isAllowed(cfg, "unknown-pkg") {
-		t.Error("expected unknown-pkg to not be allowed")
+
+	cfg.Overrides.OverrideCommand = ""
+	req = httptest.NewRequest(http.MethodGet, "/pypi/simple/requests/?apple", nil)
+	if isOverrideAllowAll(cfg, req) {
+		t.Error("expected empty override command in policy to disable overrides")
 	}
 }
 
@@ -73,5 +86,88 @@ func TestEvictExpiredDoesNotDeleteReplacement(t *testing.T) {
 	got, ok := handler.cache.Load(key)
 	if !ok || got != replacement {
 		t.Error("replacement cache entry was not preserved")
+	}
+}
+
+func TestHandlerFiltersPyPIPreleases(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/pypi/numpy/json":
+			_, _ = w.Write([]byte(`{
+				"info":{"name":"numpy","version":"2.0.0"},
+				"releases":{
+					"2.0.0":[{"filename":"numpy-2.0.0.tar.gz","upload_time_iso_8601":"2024-06-16T00:00:00Z"}],
+					"2.0.0a1":[{"filename":"numpy-2.0.0a1.tar.gz","upload_time_iso_8601":"2023-10-14T00:00:00Z"}]
+				}
+			}`))
+		case "/simple/numpy/":
+			_, _ = w.Write([]byte(`{
+				"meta":{"api-version":"1.1"},
+				"name":"numpy",
+				"files":[
+					{"filename":"numpy-2.0.0.tar.gz","url":"../../files/numpy-2.0.0.tar.gz"},
+					{"filename":"numpy-2.0.0a1.tar.gz","url":"../../files/numpy-2.0.0a1.tar.gz"}
+				],
+				"versions":["2.0.0","2.0.0a1"]
+			}`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer upstream.Close()
+
+	handler := NewHandler(&config.Policy{
+		Upstreams: map[string]string{"pypi": upstream.URL},
+		Rules:     config.Rules{BlockPrerelease: true},
+	})
+	recorder := httptest.NewRecorder()
+	handler.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/pypi/simple/numpy/", nil))
+
+	response := recorder.Result()
+	defer response.Body.Close()
+	body, _ := io.ReadAll(response.Body)
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", response.StatusCode, body)
+	}
+	if got := response.Header.Get("X-Pkgwatch-Blocked-Versions"); got != "2.0.0a1" {
+		t.Errorf("X-Pkgwatch-Blocked-Versions = %q, want %q", got, "2.0.0a1")
+	}
+	if strings.Contains(string(body), "2.0.0a1") {
+		t.Errorf("pre-release remains in PyPI index: %s", body)
+	}
+	if !strings.Contains(string(body), "2.0.0") {
+		t.Errorf("stable release missing from PyPI index: %s", body)
+	}
+}
+
+func TestHandler_InvalidUpstreamReturnsInternalServerError(t *testing.T) {
+	handler := NewHandler(&config.Policy{
+		Upstreams: map[string]string{"pypi": "::not-a-valid-url::"},
+	})
+	recorder := httptest.NewRecorder()
+	handler.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/pypi/simple/requests/", nil))
+
+	if recorder.Code != http.StatusBadGateway {
+		t.Fatalf("status = %d, want %d", recorder.Code, http.StatusBadGateway)
+	}
+}
+
+func TestForwardPreservesUpstreamBasePath(t *testing.T) {
+	var gotPath string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.Path
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer upstream.Close()
+
+	recorder := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodGet, "/npm/lodash", nil)
+	if err := forward(recorder, request, upstream.URL+"/registry", "/npm", false, nil); err != nil {
+		t.Fatalf("forward() error: %v", err)
+	}
+
+	if gotPath != "/registry/lodash" {
+		t.Errorf("upstream path = %q, want %q", gotPath, "/registry/lodash")
 	}
 }

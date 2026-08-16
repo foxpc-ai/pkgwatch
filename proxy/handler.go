@@ -6,7 +6,6 @@ import (
 	"net/http"
 	"net/http/httputil"
 	"net/url"
-	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -66,7 +65,7 @@ func (h *Handler) handle(w http.ResponseWriter, r *http.Request, reg registries.
 
 	pkg := reg.ExtractPackage(r)
 
-	if pkg != nil && !isAllowed(h.cfg, pkg.Name) {
+	if pkg != nil && !isOverrideAllowAll(h.cfg, r) {
 		index, err := h.cachedFetch(r, reg, pkg, upstream, ecosystem)
 		if err != nil {
 			http.Error(w, "pkgwatch: metadata error: "+err.Error(), http.StatusBadGateway)
@@ -122,14 +121,18 @@ func (h *Handler) handle(w http.ResponseWriter, r *http.Request, reg registries.
 					return nil
 				}
 			}
-			forward(w, r, upstream, "/"+ecosystem, ecosystem == "pypi", modify)
+			if err := forward(w, r, upstream, "/"+ecosystem, ecosystem == "pypi", modify); err != nil {
+				http.Error(w, "pkgwatch: invalid upstream: "+err.Error(), http.StatusInternalServerError)
+			}
 			return
 		}
 
 		log.Printf("ALLOWED %s/%s", ecosystem, pkg.Name)
 	}
 
-	forward(w, r, upstream, "/"+ecosystem, false, nil)
+	if err := forward(w, r, upstream, "/"+ecosystem, false, nil); err != nil {
+		http.Error(w, "pkgwatch: invalid upstream: "+err.Error(), http.StatusInternalServerError)
+	}
 }
 
 const cacheTTL = 5 * time.Minute
@@ -165,22 +168,32 @@ func (h *Handler) evictExpired(key string, entry *cacheEntry, now time.Time) boo
 	return h.cache.CompareAndDelete(key, entry)
 }
 
-func forward(w http.ResponseWriter, r *http.Request, upstream, stripPrefix string, pypiJSON bool, modify func(*http.Response) error) {
-	target, _ := url.Parse(upstream)
-	rp := &httputil.ReverseProxy{
-		Director: func(req *http.Request) {
-			req.URL.Scheme = target.Scheme
-			req.URL.Host = target.Host
-			req.URL.Path = strings.TrimPrefix(req.URL.Path, stripPrefix)
-			req.Host = target.Host
-			if pypiJSON {
-				req.Header.Set("Accept", "application/vnd.pypi.simple.v1+json")
-			}
-			req.Header.Del("Accept-Encoding")
-		},
-		ModifyResponse: modify,
+func forward(w http.ResponseWriter, r *http.Request, upstream, stripPrefix string, pypiJSON bool, modify func(*http.Response) error) error {
+	target, err := url.Parse(upstream)
+	if err != nil || target.Scheme == "" || target.Host == "" {
+		return fmt.Errorf("malformed upstream URL %q", upstream)
+	}
+	rp := &httputil.ReverseProxy{}
+	rp.Rewrite = func(proxyReq *httputil.ProxyRequest) {
+		proxyReq.Out.URL.Path = strings.TrimPrefix(proxyReq.Out.URL.Path, stripPrefix)
+		if proxyReq.Out.URL.RawPath != "" {
+			proxyReq.Out.URL.RawPath = strings.TrimPrefix(proxyReq.Out.URL.RawPath, stripPrefix)
+		}
+		proxyReq.SetURL(target)
+		proxyReq.SetXForwarded()
+		proxyReq.Out.Host = target.Host
+		if pypiJSON {
+			proxyReq.Out.Header.Set("Accept", "application/vnd.pypi.simple.v1+json")
+		}
+		proxyReq.Out.Header.Del("Accept-Encoding")
+	}
+	rp.ModifyResponse = modify
+	rp.ErrorHandler = func(rw http.ResponseWriter, req *http.Request, proxyErr error) {
+		log.Printf("UPSTREAM ERROR %s %s: %v", req.Method, req.URL.Path, proxyErr)
+		http.Error(rw, "pkgwatch: upstream request failed", http.StatusBadGateway)
 	}
 	rp.ServeHTTP(w, r)
+	return nil
 }
 
 func isPackageIndexRequest(ecosystem, path string) bool {
@@ -209,6 +222,17 @@ func checkRules(cfg *config.Policy, meta *registries.PackageMeta) string {
 	return ""
 }
 
-func isAllowed(cfg *config.Policy, name string) bool {
-	return slices.Contains(cfg.Overrides.Allow, name)
+func isOverrideAllowAll(cfg *config.Policy, r *http.Request) bool {
+	configured := strings.TrimSpace(cfg.Overrides.OverrideCommand)
+	if configured == "" {
+		return false
+	}
+
+	for key := range r.URL.Query() {
+		if cfg.Overrides.AllowAll(key) {
+			return true
+		}
+	}
+
+	return cfg.Overrides.AllowAll(r.URL.Query().Get("override_command"))
 }
