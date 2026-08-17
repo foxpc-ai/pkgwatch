@@ -36,8 +36,12 @@ type PyPI struct{}
 
 var httpClient = &http.Client{Timeout: 10 * time.Second}
 
-// matches PEP 440 pre-release markers: alpha (aN), beta (bN), rc (rcN), dev
-var prereleaseRE = regexp.MustCompile(`(?i)\d(a|b|rc)\d|\.dev\d`)
+var prereleaseRE = regexp.MustCompile(`(?i)(?:^|[0-9._-])(?:a|b|c|rc|alpha|beta|pre|preview|dev)(?:[._-]?\d+)?(?:$|[._-])`)
+
+func isPyPIPreRelease(version string) bool {
+	publicVersion := strings.SplitN(version, "+", 2)[0]
+	return prereleaseRE.MatchString(publicVersion)
+}
 
 func (PyPI) ExtractPackage(r *http.Request) *PackageMeta {
 	path := strings.TrimPrefix(r.URL.Path, "/pypi")
@@ -121,7 +125,7 @@ func (PyPI) FetchVersionIndex(ctx context.Context, pkg *PackageMeta, upstream st
 				Name:         data.Info.Name,
 				Version:      version,
 				PublishedAt:  published,
-				IsPrerelease: prereleaseRE.MatchString(version),
+				IsPrerelease: isPyPIPreRelease(version),
 			}
 		}
 	}
